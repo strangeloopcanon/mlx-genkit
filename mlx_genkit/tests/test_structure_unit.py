@@ -136,6 +136,26 @@ class StructureTests(unittest.TestCase):
         self.assertIsNone(result.json)
         self.assertTrue(any(v.get("type") == "parse_error" for v in result.violations))
 
+    def test_json_schema_grammar_reports_not_supported(self):
+        backend = _StubBackend([json.dumps({"a": 1})])
+        engine = StructuredGenerationEngine(
+            backend=backend,
+            prompt="respond",
+            config=GenerationConfig(),
+            hooks=None,
+            json_schema={"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            grammar=Grammar.json_schema({"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}),
+            validators=[lambda data: (isinstance(data.get("a"), int), None)],
+            semantic_checks=None,
+            adherence=JsonAdherence(retries=0, strict_only_json=True),
+            on_parse_fail=None,
+            on_semantic_fail=None,
+            log_writer=None,
+        )
+        result = engine.run()
+        self.assertEqual(result.meta.get("grammar_kind"), "json_schema")
+        self.assertFalse(result.meta.get("grammar_supported"))
+
     def test_stream_observer_tracks_valid_json(self):
         adherence = JsonAdherence(strict_only_json=True)
         tokenizer = _CharTokenizer()

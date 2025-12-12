@@ -18,6 +18,7 @@ from ..utils import (
     set_seed,
     stable_log_softmax,
     as_mx_array,
+    filter_kwargs_for_callable,
 )
 
 
@@ -228,23 +229,55 @@ def _build_generation_setup(
 
 
 def _step_logits(model, components: ModelComponents, input_tokens, cache=None, input_embeddings=None):
-    # Returns logits for last position and possibly updated cache
-    # Some models do not support input_embeddings kwarg
+    """Compute last-position logits, handling common MLX(-LM) return conventions."""
+
+    def _split_output(output: Any, prev_cache: Any):
+        logits_local = output
+        next_cache = prev_cache
+        if isinstance(output, dict):
+            if "logits" in output:
+                logits_local = output["logits"]
+            if "cache" in output:
+                next_cache = output["cache"]
+        elif isinstance(output, (tuple, list)) and output:
+            logits_local = output[0]
+            if len(output) >= 2:
+                next_cache = output[1]
+        else:
+            if hasattr(output, "logits"):
+                logits_local = getattr(output, "logits")
+            if hasattr(output, "cache"):
+                next_cache = getattr(output, "cache")
+        return logits_local, next_cache
+
+    # Some models do not support input_embeddings kwarg.
     if input_embeddings is not None:
         try:
             out = model(input_tokens, cache=cache, input_embeddings=input_embeddings)  # type: ignore
         except TypeError:
-            # Fallback: ignore input_embeddings
             out = model(input_tokens, cache=cache)  # type: ignore
     else:
         out = model(input_tokens, cache=cache)  # type: ignore
-    # If model returns logits already, assume shape [B, L, V]
-    logits = out
-    # Some models may return hidden states prior to head; detect via shape heuristic
-    if logits.ndim == 3 and logits.shape[-1] == components.hidden_size and components.vocab_size != components.hidden_size:
-        hidden = logits
-        logits = project_logits(components, hidden)
-    return logits[:, -1, :], cache
+
+    logits, next_cache = _split_output(out, cache)
+
+    # Some models may return hidden states prior to head; detect via shape heuristic.
+    hidden_size = int(getattr(components, "hidden_size", 0) or 0)
+    vocab_size = int(getattr(components, "vocab_size", 0) or 0)
+    if hidden_size and hasattr(logits, "ndim") and logits.ndim in (2, 3) and logits.shape[-1] == hidden_size:
+        if (not vocab_size) or vocab_size != hidden_size:
+            logits = project_logits(components, logits)
+
+    if not hasattr(logits, "ndim"):
+        raise ValueError("Model output does not look like an array")  # pragma: no cover - defensive
+
+    if logits.ndim == 3:
+        return logits[:, -1, :], next_cache
+    if logits.ndim == 2:
+        return logits, next_cache
+    if logits.ndim == 1:
+        return logits.reshape((1, -1)), next_cache
+    raise ValueError(f"Unsupported logits rank: {logits.ndim}")  # pragma: no cover - defensive
 
 
 def _batched_last_logits(
@@ -431,11 +464,16 @@ def generate_dict(
             gen = mlx_generate_step(
                 as_mx_array(tokens, dtype=mx.int32),
                 model,
-                max_tokens=config.max_tokens,
-                sampler=sampler,
-                logits_processors=processors,
-                max_kv_size=config.max_kv_size,
-                prompt_cache=prompt_cache,
+                **filter_kwargs_for_callable(
+                    mlx_generate_step,
+                    {
+                        "max_tokens": config.max_tokens,
+                        "sampler": sampler,
+                        "logits_processors": processors,
+                        "max_kv_size": config.max_kv_size,
+                        "prompt_cache": prompt_cache,
+                    },
+                ),
             )
             for y, logprobs in gen:
                 try:
@@ -551,11 +589,16 @@ def generate_dict(
                     as_mx_array(tokens, dtype=mx.int32),
                     model,
                     draft_model,
-                    num_draft_tokens=config.num_draft_tokens,
-                    max_tokens=config.max_tokens,
-                    sampler=sampler,
-                    logits_processors=processors,
-                    prompt_cache=None,
+                    **filter_kwargs_for_callable(
+                        speculative_generate_step,
+                        {
+                            "num_draft_tokens": config.num_draft_tokens,
+                            "max_tokens": config.max_tokens,
+                            "sampler": sampler,
+                            "logits_processors": processors,
+                            "prompt_cache": None,
+                        },
+                    ),
                 )
                 for y, logprobs, _from_draft in gen:
                     try:

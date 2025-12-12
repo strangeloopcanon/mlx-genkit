@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mlx-genkit"
-version = "0.4.2"
+version = "0.4.5"
 description = "MLX generation parity utils with HF/Torch-compatible sampling, processors, and steering hooks"
 authors = [{name = "Your Team"}]
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-  "mlx>=0.17.0",
-  "mlx-lm>=0.17.0",
+  "mlx>=0.17.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "mlx-lm>=0.17.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
   "transformers>=4.40.0; python_version >= '3.9'",
 ]
 classifiers = [
@@ -21,6 +21,16 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/strangeloopcanon/mlx-genkit"
+
+[project.optional-dependencies]
+validation = [
+  "jsonschema>=4.0.0",
+  "pydantic>=1.10.0",
+]
+data = [
+  "numpy>=1.20.0",
+  "pyyaml>=6.0.0",
+]
 
 [tool.setuptools]
 packages = ["mlx_genkit"]

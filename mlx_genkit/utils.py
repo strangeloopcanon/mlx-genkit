@@ -177,3 +177,19 @@ def clone_reference(model: Any) -> Any:
         raise RuntimeError(
             "clone_reference: deepcopy failed for this model. Consider reloading the model via `mlx_lm.load(...)` to create an independent reference."
         ) from e
+
+
+def filter_kwargs_for_callable(fn: Any, kwargs: dict) -> dict:
+    """Return only kwargs accepted by `fn`'s signature.
+
+    Used to keep compatibility with evolving upstream signatures (e.g. mlx-lm).
+    If signature introspection fails, returns `kwargs` unchanged.
+    """
+
+    try:
+        from inspect import signature
+
+        sig = signature(fn)
+    except Exception:  # pragma: no cover - defensive
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}

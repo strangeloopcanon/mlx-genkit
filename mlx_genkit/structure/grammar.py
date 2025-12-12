@@ -33,13 +33,16 @@ class Grammar:
         return cls(kind="fst", payload=automaton)
 
     def supports_backend(self, backend_name: str) -> bool:
-        """Return True if the grammar is natively supported by the backend."""
+        """Return True if the grammar is *natively enforced* by the backend.
+
+        Today, mlx-genkit treats grammars as *declarative constraints* and
+        enforces them via post-generation parsing/validation + retries. This
+        method is reserved for backends that can do constrained decoding.
+        """
 
         backend_name = backend_name.lower()
-        if self.kind == "json_schema":
-            return True
-        if backend_name == "mlx":
-            # MLX backend currently lacks direct grammar support.
-            return False
-        # Future hooks: transformers/vllm backends may report support.
+        # No backends currently implement native constrained decoding in this
+        # repo (transformers/vllm backends are placeholders). Keep returning
+        # False so callers can surface "fallback to retries" messaging.
+        _ = backend_name
         return False

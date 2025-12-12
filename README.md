@@ -19,14 +19,15 @@ Install
 ```
 pip install mlx-genkit
 ```
-- Dependencies (if not already installed):
-```
-pip install mlx mlx-lm transformers
-```
+- Optional extras:
+  - Validators for structured output: `pip install "mlx-genkit[validation]"`
+  - YAML suites + token dataset loader: `pip install "mlx-genkit[data]"`
 - From source (editable):
 ```
 pip install -e .
 ```
+
+Note: `mlx`/`mlx-lm` are only available on Apple Silicon macOS; they are installed automatically there.
 
 Models from Hugging Face
 - If the repo provides MLX weights (e.g., in `mlx-community`), you can load directly: `load('mlx-community/<model>')`.

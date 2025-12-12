@@ -231,23 +231,28 @@ def apply_lora(
 
 
 def merge_lora(model: Any) -> None:
-    # Merge if LoRA was applied
+    """Merge any applied LoRA adapters into base weights and restore forward.
+
+    `apply_lora` patches modules by replacing their `__call__` with a bound
+    wrapper method; we detect that wrapper here and invoke its merge/restore.
+    """
+
     for _, module in model.named_modules():
         for _, child in module.items():
-            if isinstance(child, dict):
+            call = getattr(child, "__call__", None)
+            wrapper = getattr(call, "__self__", None)
+            if wrapper is None:
                 continue
-            if hasattr(child, "_lora_A") and hasattr(child, "_lora_B"):
-                # Reconstruct a LoRA wrapper to merge
-                # Shapes
-                A = child["_lora_A"]
-                B = child["_lora_B"]
-                scale = float(child["_lora_scale"].item()) if hasattr(child["_lora_scale"], 'item') else float(child["_lora_scale"])  # type: ignore
-                delta = (B @ A.T) * scale
-                child["weight"] = child["weight"] + delta
-                # Remove LoRA params, keep forward patched or restore?
-                del child["_lora_A"]
-                del child["_lora_B"]
-                del child["_lora_scale"]
+
+            linear = getattr(wrapper, "linear", None)
+            merge = getattr(wrapper, "merge", None)
+            restore = getattr(wrapper, "restore", None)
+            if linear is child and callable(merge) and callable(restore):
+                try:
+                    merge()
+                    restore()
+                except Exception:
+                    pass
 
 
 def unmerge_lora(model: Any) -> None:

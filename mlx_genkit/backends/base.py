@@ -8,6 +8,8 @@ from .mlx_backend import MlxGenerateBackend
 from .transformers_backend import TransformersGenerateBackend
 from .vllm_backend import VLLMGenerateBackend
 
+_SUPPORTED_BACKEND_NAMES = ("default", "hf", "mlx", "transformers", "vllm")
+
 
 class GenerateBackend(Protocol):
     """Protocol implemented by concrete generation backends."""
@@ -40,4 +42,5 @@ def resolve_backend(
         return TransformersGenerateBackend(model=model, tokenizer=tokenizer)
     if name == "vllm":
         return VLLMGenerateBackend(model=model, tokenizer=tokenizer)
-    raise ValueError(f"Unsupported backend '{backend_name}'. Available: mlx")
+    supported = ", ".join(_SUPPORTED_BACKEND_NAMES)
+    raise ValueError(f"Unsupported backend '{backend_name}'. Supported backends: {supported}")

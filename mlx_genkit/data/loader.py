@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import threading
 import queue
+import warnings
 from dataclasses import dataclass
 from typing import Iterable, Iterator, List, Optional, Tuple
 
@@ -89,20 +90,33 @@ class PrefetchDataLoader:
         prefetch: int = 4,
         seed: Optional[int] = None,
     ) -> None:
-        self.dataset = list(dataset)
+        self.dataset = dataset
+        self._is_sequence = hasattr(dataset, "__len__") and hasattr(dataset, "__getitem__")
         self.batch_size = int(batch_size)
         self.prefetch = max(1, int(prefetch))
         self.seed = seed
         self._q: queue.Queue = queue.Queue(maxsize=self.prefetch)
         self._stop = threading.Event()
         self._t: Optional[threading.Thread] = None
+        if not self._is_sequence:
+            warnings.warn(
+                "PrefetchDataLoader: dataset is iterable-only; shuffle is disabled without sequence semantics.",
+                RuntimeWarning,
+            )
 
     def _worker(self):
         import random
-        random.Random(self.seed).shuffle(self.dataset)
+
+        rng = random.Random(self.seed)
+        if self._is_sequence:
+            indices = list(range(len(self.dataset)))  # type: ignore[arg-type]
+            rng.shuffle(indices)
+            seq_iter = (self.dataset[i] for i in indices)  # type: ignore[index]
+        else:
+            seq_iter = iter(self.dataset)
         mx, _ = try_import_mlx()
         batch: List[List[int]] = []
-        for seq in self.dataset:
+        for seq in seq_iter:
             batch.append(seq)
             if len(batch) == self.batch_size:
                 arr = as_mx_array(batch, dtype=mx.int32)
@@ -127,4 +141,3 @@ class PrefetchDataLoader:
         self._stop.set()
         if self._t is not None:
             self._t.join(timeout=1.0)
-

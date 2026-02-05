@@ -17,6 +17,14 @@ __all__ = [
     # Training utilities
     "sequence_logprob",
     "token_kl",
+    # RL objectives
+    "PPOConfig",
+    "ppo_loss",
+    "GRPOConfig",
+    "grpo_advantages",
+    "grpo_loss",
+    "GSPOConfig",
+    "gspo_loss",
     # Model helpers
     "ema_update",
     "build_action_mask",
@@ -63,6 +71,15 @@ from .training import (
     train_step,
     sequence_logprob,
     token_kl,
+)
+from .rl.ppo import (
+    PPOConfig,
+    ppo_loss,
+    GRPOConfig,
+    grpo_advantages,
+    grpo_loss,
+    GSPOConfig,
+    gspo_loss,
 )
 
 from .utils import ema_update, build_action_mask, stable_softmax, clone_reference

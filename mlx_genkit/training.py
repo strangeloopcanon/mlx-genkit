@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import warnings
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .adapters import make_tokenizer_bridge, detect_components, project_logits, ModelComponents
@@ -18,6 +19,9 @@ class TrainingConfig:
     dtype: Optional[str] = None  # 'bf16' for mixed precision compute
     label_smoothing: float = 0.0
     loss_scale: float = 1.0  # for mixed precision
+
+
+_GRAD_ACCUM_STATE_BY_OPT_ID: Dict[int, Dict[str, Any]] = {}
 
 
 def _ensure_soft_prompt(model, components: ModelComponents, hook: SoftPromptHook):
@@ -111,6 +115,15 @@ def loss_forward(
                     bias = (vec.reshape((1, -1)) @ W.T).reshape((-1,)) * h.alpha
                     logits = logits + bias.reshape((1, 1, -1))
 
+    if mask is not None:
+        if mask.shape != logits.shape[:2]:
+            raise ValueError(
+                f"loss_forward: mask shape {mask.shape} must match token dims {logits.shape[:2]}"
+            )
+        m = (mask.astype(mx.int32) != 0).reshape((logits.shape[0], logits.shape[1], 1))
+        # Keep masked positions out of the supervised gradient path.
+        logits = mx.where(m, logits, mx.stop_gradient(logits))
+
     logits = logits.astype(mx.float32)
     return logits
 
@@ -121,6 +134,7 @@ def xent_loss(
     *,
     ignore_index: int,
     label_smoothing: float = 0.0,
+    mask: Optional[Any] = None,  # [B, T] bool/int, True/1 keeps token
 ) -> Any:
     mx, _ = try_import_mlx()
     V = logits.shape[-1]
@@ -128,6 +142,12 @@ def xent_loss(
     B, T = labels.shape
     labels = labels.astype(mx.int32)
     valid = labels != ignore_index
+    if mask is not None:
+        if mask.shape != labels.shape:
+            raise ValueError(
+                f"xent_loss: mask shape {mask.shape} must match labels shape {labels.shape}"
+            )
+        valid = valid & (mask.astype(mx.int32) != 0)
     labels_clamped = mx.maximum(labels, 0)
     gathered = mx.take_along_axis(logprobs, labels_clamped.reshape(B, T, 1), axis=-1).reshape(B, T)
     if label_smoothing and label_smoothing > 0.0:
@@ -213,10 +233,15 @@ def apply_lora(
                 del self.linear["_lora_scale"]
 
         def merge(self):
-            # W := W + B @ A^T * scale
-            delta = (self.B @ self.A.T) * self.scale
+            # forward update is x @ A @ B, so weight delta is (A @ B)^T
+            delta = (self.A @ self.B).T * self.scale
+            if delta.shape != self.linear.weight.shape:
+                raise ValueError(
+                    f"LoRA merge shape mismatch: delta {delta.shape} vs weight {self.linear.weight.shape}"
+                )
             self.linear.weight = self.linear.weight + delta
 
+    failures: List[str] = []
     for parent_name, module in model.named_modules():
         for name, child in module.items():
             full = f"{parent_name}.{name}" if parent_name else name
@@ -225,8 +250,15 @@ def apply_lora(
                     lr = LoRALinear(child, rank, alpha)
                     lr.apply()
                     patched.append(lr)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    failures.append(f"{full}: {exc}")
+    if failures:
+        head = "; ".join(failures[:3])
+        extra = "" if len(failures) <= 3 else f" (+{len(failures) - 3} more)"
+        warnings.warn(
+            f"apply_lora: failed to patch {len(failures)} module(s): {head}{extra}",
+            RuntimeWarning,
+        )
     return patched
 
 
@@ -237,22 +269,55 @@ def merge_lora(model: Any) -> None:
     wrapper method; we detect that wrapper here and invoke its merge/restore.
     """
 
-    for _, module in model.named_modules():
-        for _, child in module.items():
-            call = getattr(child, "__call__", None)
-            wrapper = getattr(call, "__self__", None)
+    def _detect_wrapper(child: Any):
+        candidates = []
+        child_dict = getattr(child, "__dict__", None)
+        if isinstance(child_dict, dict) and "__call__" in child_dict:
+            candidates.append(child_dict["__call__"])
+        call = getattr(child, "__call__", None)
+        if call is not None:
+            candidates.append(call)
+
+        seen = set()
+        for cand in candidates:
+            wrapper = getattr(cand, "__self__", None)
             if wrapper is None:
                 continue
-
+            wid = id(wrapper)
+            if wid in seen:
+                continue
+            seen.add(wid)
             linear = getattr(wrapper, "linear", None)
             merge = getattr(wrapper, "merge", None)
             restore = getattr(wrapper, "restore", None)
             if linear is child and callable(merge) and callable(restore):
-                try:
-                    merge()
-                    restore()
-                except Exception:
-                    pass
+                return wrapper
+        return None
+
+    failures: List[str] = []
+    seen_wrappers = set()
+    for parent_name, module in model.named_modules():
+        for _, child in module.items():
+            wrapper = _detect_wrapper(child)
+            if wrapper is None:
+                continue
+            wid = id(wrapper)
+            if wid in seen_wrappers:
+                continue
+            seen_wrappers.add(wid)
+            full = parent_name or "<root>"
+            try:
+                wrapper.merge()
+                wrapper.restore()
+            except Exception as exc:
+                failures.append(f"{full}: {exc}")
+    if failures:
+        head = "; ".join(failures[:3])
+        extra = "" if len(failures) <= 3 else f" (+{len(failures) - 3} more)"
+        warnings.warn(
+            f"merge_lora: failed to merge {len(failures)} module(s): {head}{extra}",
+            RuntimeWarning,
+        )
 
 
 def unmerge_lora(model: Any) -> None:
@@ -298,15 +363,24 @@ def train_step(
         return fn(x, y)
 
     tokens = batch["tokens"]
+    mask = batch.get("mask")
     B, L = tokens.shape
     ignore_index = pad_id if pad_id is not None else -100
+    if mask is not None and mask.shape != tokens.shape:
+        raise ValueError(
+            f"train_step: mask shape {mask.shape} must match tokens shape {tokens.shape}"
+        )
 
-    def loss_fn(tokens_slice):
+    def loss_fn(tokens_slice, mask_slice=None):
+        logits = loss_forward(model, tokens_slice, mask=mask_slice, hooks=hooks)[:, :-1, :]
+        labels = tokens_slice[:, 1:]
+        sup_mask = None if mask_slice is None else mask_slice[:, 1:]
         return xent_loss(
-            loss_forward(model, tokens_slice, hooks=hooks)[:, :-1, :],
-            tokens_slice[:, 1:],
+            logits,
+            labels,
             ignore_index=ignore_index,
             label_smoothing=cfg.label_smoothing,
+            mask=sup_mask,
         )
 
     # Microbatch split
@@ -317,45 +391,61 @@ def train_step(
 
     total_loss = 0.0
     total_steps = 0
-    grads_accum = None
+    grads_batch = None
+    for i in splits:
+        sl = tokens[i : i + (cfg.microbatch or B)]
+        ml = None if mask is None else mask[i : i + (cfg.microbatch or B)]
+        # Compute value and grads wrt model trainable params
+        # Mixed-precision compute path: cast params to bf16 for compute only
+        if cfg.dtype == "bf16":
+            fp32_params = model.trainable_parameters()
+            bf16_params = _tree_map_unary(lambda p: p.astype(mx.bfloat16), fp32_params)
+            model.update(bf16_params)
+            val_and_grad = nn.value_and_grad(model, lambda: loss_fn(sl, ml) * cfg.loss_scale)
+            loss, grads = val_and_grad()
+            # Back to fp32 params for optimizer update later
+            model.update(fp32_params)
+            grads = _tree_map_unary(lambda g: g.astype(mx.float32) / cfg.loss_scale, grads)
+            loss = loss / cfg.loss_scale
+        else:
+            val_and_grad = nn.value_and_grad(model, lambda: loss_fn(sl, ml))
+            loss, grads = val_and_grad()
+        total_loss = total_loss + float(loss.item())
+        total_steps += 1
+        if grads_batch is None:
+            grads_batch = grads
+        else:
+            grads_batch = _tree_map_binary(lambda a, b: a + b, grads_batch, grads)
 
-    def closure():
-        nonlocal total_loss, total_steps, grads_accum
-        for i in splits:
-            sl = tokens[i : i + (cfg.microbatch or B)]
-            # Compute value and grads wrt model trainable params
-            # Mixed-precision compute path: cast params to bf16 for compute only
-            if cfg.dtype == "bf16":
-                fp32_params = model.trainable_parameters()
-                bf16_params = _tree_map_unary(lambda p: p.astype(mx.bfloat16), fp32_params)
-                model.update(bf16_params)
-                val_and_grad = nn.value_and_grad(model, lambda: loss_fn(sl) * cfg.loss_scale)
-                loss, grads = val_and_grad()
-                # Back to fp32 params for optimizer update later
-                model.update(fp32_params)
-                grads = _tree_map_unary(lambda g: g.astype(mx.float32) / cfg.loss_scale, grads)
-                loss = loss / cfg.loss_scale
-            else:
-                val_and_grad = nn.value_and_grad(model, lambda: loss_fn(sl))
-                loss, grads = val_and_grad()
-            total_loss = total_loss + float(loss.item())
-            total_steps += 1
-            if grads_accum is None:
-                grads_accum = grads
-            else:
-                grads_accum = _tree_map_binary(lambda a, b: a + b, grads_accum, grads)
-        # Average grads over microbatches
-        if total_steps > 1:
-            grads_accum = _tree_map_unary(lambda g: g / total_steps, grads_accum)
+    # Average grads over microbatches
+    if total_steps > 1:
+        grads_batch = _tree_map_unary(lambda g: g / total_steps, grads_batch)
 
-    closure()
+    accum_target = max(1, int(getattr(cfg, "grad_accum", 1) or 1))
+    opt_id = id(optimizer)
+    state = _GRAD_ACCUM_STATE_BY_OPT_ID.get(opt_id)
+    if state is None or state.get("target") != accum_target:
+        state = {"grads": None, "steps": 0, "target": accum_target}
 
-    # Clip gradients
-    from mlx.optimizers import clip_grad_norm
+    if state["grads"] is None:
+        state["grads"] = grads_batch
+    else:
+        state["grads"] = _tree_map_binary(lambda a, b: a + b, state["grads"], grads_batch)
+    state["steps"] = int(state["steps"]) + 1
 
-    clipped, _ = clip_grad_norm(grads_accum, cfg.grad_clip)
-    optimizer.update(model, clipped)
+    if state["steps"] >= accum_target:
+        grads_to_apply = state["grads"]
+        if state["steps"] > 1:
+            grads_to_apply = _tree_map_unary(lambda g: g / state["steps"], grads_to_apply)
 
+        # Clip gradients
+        from mlx.optimizers import clip_grad_norm
+
+        clipped, _ = clip_grad_norm(grads_to_apply, cfg.grad_clip)
+        optimizer.update(model, clipped)
+        state = {"grads": None, "steps": 0, "target": accum_target}
+
+    _GRAD_ACCUM_STATE_BY_OPT_ID[opt_id] = state
     return total_loss / max(total_steps, 1)
 
 

@@ -14,6 +14,18 @@ class ValidatorResult:
     validator_name: str
 
 
+def _coerce_error_list(err: Any) -> List[str]:
+    if err is None:
+        return []
+    if isinstance(err, str):
+        return [err] if err else []
+    if isinstance(err, dict):
+        return [str(err)]
+    if isinstance(err, Iterable):
+        return [str(e) for e in err]
+    return [str(err)]
+
+
 def _jsonschema_validator(schema: Any) -> Callable[[Any], ValidatorResult]:
     if schema is None:
         raise ValueError("json_schema must be provided for jsonschema validation")
@@ -79,16 +91,20 @@ def _callable_validator(fn: Callable[[Any], Any], name: Optional[str] = None) ->
             return ValidatorResult(ok=outcome, errors=[] if outcome else [f"{validator_name} returned False"], validator_name=validator_name)
         if isinstance(outcome, tuple) and len(outcome) == 2:
             ok, err = outcome
-            err_list = []
-            if err is None:
-                err_list = []
-            elif isinstance(err, str):
-                err_list = [err]
-            elif isinstance(err, Iterable):
-                err_list = [str(e) for e in err]
-            else:
-                err_list = [str(err)]
+            err_list = _coerce_error_list(err)
             return ValidatorResult(ok=bool(ok), errors=err_list, validator_name=validator_name)
+        if isinstance(outcome, str):
+            err_list = _coerce_error_list(outcome)
+            return ValidatorResult(
+                ok=False,
+                errors=err_list or [f"{validator_name} returned an error"],
+                validator_name=validator_name,
+            )
+        if isinstance(outcome, Iterable) and not isinstance(outcome, dict):
+            err_list = _coerce_error_list(outcome)
+            if err_list:
+                return ValidatorResult(ok=False, errors=err_list, validator_name=validator_name)
+            return ValidatorResult(ok=True, errors=[], validator_name=validator_name)
         return ValidatorResult(ok=True, errors=[], validator_name=validator_name)
 
     _validate.__validator_name__ = validator_name  # type: ignore[attr-defined]

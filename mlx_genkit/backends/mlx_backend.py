@@ -44,6 +44,155 @@ class GenerationSetup:
     forced_bos: Optional[int]
 
 
+@dataclass
+class _IncrementalRawStopState:
+    generated_text: str
+    max_stop_length: int
+    enabled: bool = True
+
+
+def _decode_generated_suffix(tk: Any, tokens: Sequence[int], prompt_len: int) -> str:
+    if len(tokens) <= prompt_len:
+        return ""
+    return tk.decode(list(tokens[prompt_len:]))
+
+
+def _find_earliest_stop_index(text: str, raw_stops: Sequence[str]) -> Optional[int]:
+    earliest: Optional[int] = None
+    for stop in raw_stops:
+        if not stop:
+            continue
+        idx = text.find(stop)
+        if idx < 0:
+            continue
+        if earliest is None or idx < earliest:
+            earliest = idx
+    return earliest
+
+
+def _trim_tokens_by_generated_text(
+    tk: Any,
+    tokens: List[int],
+    prompt_len: int,
+    generated_text: str,
+) -> List[int]:
+    trimmed_gen_ids = tk.encode(generated_text, add_special_tokens=False)
+    return tokens[:prompt_len] + trimmed_gen_ids
+
+
+def _match_raw_stops_full_decode(
+    tk: Any,
+    tokens: List[int],
+    prompt_len: int,
+    raw_stops: Sequence[str],
+) -> Tuple[List[int], bool]:
+    gen_tokens = tokens[prompt_len:]
+    if not gen_tokens:
+        return tokens, False
+    decoded_gen = tk.decode(gen_tokens)
+    idx = _find_earliest_stop_index(decoded_gen, raw_stops)
+    if idx is None:
+        return tokens, False
+    return _trim_tokens_by_generated_text(tk, tokens, prompt_len, decoded_gen[:idx]), True
+
+
+def _make_incremental_raw_stop_state(
+    raw_stops: Sequence[str],
+    *,
+    enabled: bool,
+) -> Optional[_IncrementalRawStopState]:
+    if not enabled:
+        return None
+    max_stop_len = max((len(stop) for stop in raw_stops if stop), default=0)
+    if max_stop_len <= 0:
+        return None
+    return _IncrementalRawStopState(generated_text="", max_stop_length=max_stop_len, enabled=True)
+
+
+def _match_raw_stops_incremental(
+    tk: Any,
+    tokens: List[int],
+    prompt_len: int,
+    raw_stops: Sequence[str],
+    state: _IncrementalRawStopState,
+    new_token: int,
+) -> Tuple[List[int], bool]:
+    if state.enabled:
+        try:
+            piece = tk.decode([new_token])
+        except Exception:
+            state.enabled = False
+        else:
+            if piece:
+                state.generated_text += piece
+                search_from = max(0, len(state.generated_text) - len(piece) - state.max_stop_length)
+                idx = _find_earliest_stop_index(state.generated_text[search_from:], raw_stops)
+                if idx is not None:
+                    stop_idx = search_from + idx
+                    trimmed = state.generated_text[:stop_idx]
+                    state.generated_text = trimmed
+                    return _trim_tokens_by_generated_text(tk, tokens, prompt_len, trimmed), True
+    if not state.enabled:
+        tokens, hit = _match_raw_stops_full_decode(tk, tokens, prompt_len, raw_stops)
+        if hit:
+            state.generated_text = _decode_generated_suffix(tk, tokens, prompt_len)
+        return tokens, hit
+    return tokens, False
+
+
+def _detect_tokenizer_vocab_size(tokenizer: Any) -> Optional[int]:
+    vocab = getattr(tokenizer, "vocab_size", None)
+    if isinstance(vocab, int) and vocab > 0:
+        return vocab
+    try:
+        size = len(tokenizer)
+    except Exception:
+        size = None
+    if isinstance(size, int) and size > 0:
+        return size
+    return None
+
+
+def _check_speculative_tokenizer_compatibility(
+    base_tokenizer: Any,
+    draft_tokenizer: Any,
+    *,
+    prompt_hint: Optional[str] = None,
+) -> Tuple[bool, Optional[str]]:
+    if draft_tokenizer is None:
+        return False, "speculative_draft_tokenizer_unavailable"
+    base_tk = make_tokenizer_bridge(base_tokenizer)
+    draft_tk = make_tokenizer_bridge(draft_tokenizer)
+
+    base_vocab = _detect_tokenizer_vocab_size(base_tokenizer)
+    draft_vocab = _detect_tokenizer_vocab_size(draft_tokenizer)
+    if base_vocab is not None and draft_vocab is not None and base_vocab != draft_vocab:
+        return False, "speculative_vocab_size_mismatch"
+
+    if (
+        base_tk.eos_token_id is not None
+        and draft_tk.eos_token_id is not None
+        and base_tk.eos_token_id != draft_tk.eos_token_id
+    ):
+        return False, "speculative_eos_token_mismatch"
+
+    probes = ["", "a", "hello", " hello", "\n", "A quick compatibility probe."]
+    if prompt_hint:
+        probes.append(prompt_hint[:64])
+    checked_any = False
+    for idx, text in enumerate(probes):
+        try:
+            base_ids = base_tk.encode(text, add_special_tokens=False)
+            draft_ids = draft_tk.encode(text, add_special_tokens=False)
+        except Exception:
+            continue
+        checked_any = True
+        if base_ids != draft_ids:
+            return False, f"speculative_encoding_mismatch_probe_{idx}"
+    if not checked_any:
+        return True, None
+    return True, None
+
 
 def _prepare_prompt(tokenizer, prompt: Union[str, Sequence[int]]):
     tk = make_tokenizer_bridge(tokenizer)
@@ -405,12 +554,13 @@ def generate_dict(
     processors = setup.processors
     tk = setup.tk
     prompt_ids = setup.prompt_tokens
+    prompt_len = len(prompt_ids)
     tokens: List[int] = list(prompt_ids)
     y = as_mx_array(tokens, dtype=mx.int32)[None]
     n_generated = 0
-    text_out = ""
     eos_reached = False
     finish_reason: Optional[str] = None
+    speculative_fallback_reason: Optional[str] = None
 
     # Handle forced BOS token at first generation step
     forced_bos = setup.forced_bos
@@ -422,6 +572,19 @@ def generate_dict(
     stop_token_seqs = setup.stop_token_sequences
     raw_stops = setup.raw_stop_strings
     components = setup.components
+
+    def _build_response(current_tokens: List[int], current_eos: bool, current_finish: Optional[str]) -> Dict[str, Any]:
+        payload = {
+            "text": _decode_generated_suffix(tk, current_tokens, prompt_len),
+            "tokens": current_tokens,
+            "eos_reached": current_eos,
+            "finish_reason": current_finish,
+            "stream_tokens_emitted": stream_observer.emitted if stream_observer else 0,
+            "stream_invalid_path": bool(stream_observer and stream_observer.invalid_triggered),
+        }
+        if speculative_fallback_reason:
+            payload["speculative_fallback_reason"] = speculative_fallback_reason
+        return payload
 
     sampler = make_sampler(
         temperature=config.temperature,
@@ -437,6 +600,7 @@ def generate_dict(
     invalid_stop = False
     if stream_observer is not None and not config.use_speculative and not (config.num_beams and config.num_beams > 1):
         active_stream = stream_observer
+    main_raw_stop_state = _make_incremental_raw_stop_state(raw_stops, enabled=active_stream is None)
 
     # Fast path using mlx-lm generate_step when possible (no residual injection)
     if injector is None and not (config.num_beams and config.num_beams > 1) and not config.use_speculative:
@@ -459,6 +623,7 @@ def generate_dict(
             n_generated = 0
             eos_reached = False
             finish_reason = None
+            fast_raw_stop_state = _make_incremental_raw_stop_state(raw_stops, enabled=active_stream is None)
 
             # Use mlx-lm generate_step and our processors
             gen = mlx_generate_step(
@@ -514,20 +679,21 @@ def generate_dict(
                         break
                 # String fallback stops on generated suffix
                 if raw_stops:
-                    gen_tokens = tokens[len(prompt_ids):]
-                    if gen_tokens:
-                        decoded_gen = tk.decode(gen_tokens)
-                        for s in raw_stops:
-                            if s and s in decoded_gen:
-                                idx = decoded_gen.find(s)
-                                text_trimmed = decoded_gen[:idx]
-                                trimmed_gen_ids = tk.encode(text_trimmed, add_special_tokens=False)
-                                tokens = tokens[: len(prompt_ids)] + trimmed_gen_ids
-                                eos_reached = True
-                                finish_reason = "stop_sequence"
-                                break
-                        if eos_reached:
-                            break
+                    if fast_raw_stop_state is not None:
+                        tokens, hit = _match_raw_stops_incremental(
+                            tk,
+                            tokens,
+                            prompt_len,
+                            raw_stops,
+                            fast_raw_stop_state,
+                            t,
+                        )
+                    else:
+                        tokens, hit = _match_raw_stops_full_decode(tk, tokens, prompt_len, raw_stops)
+                    if hit:
+                        eos_reached = True
+                        finish_reason = "stop_sequence"
+                        break
                 if n_generated >= config.max_tokens:
                     finish_reason = "length"
                     break
@@ -536,15 +702,7 @@ def generate_dict(
                 finish_reason = "invalid_path"
             if finish_reason is None and n_generated >= config.max_tokens:
                 finish_reason = "length"
-            text_out = tk.decode(tokens)
-            return {
-                "text": text_out,
-                "tokens": tokens,
-                "eos_reached": eos_reached,
-                "finish_reason": finish_reason,
-                "stream_tokens_emitted": stream_observer.emitted if stream_observer else 0,
-                "stream_invalid_path": bool(stream_observer and stream_observer.invalid_triggered),
-            }
+            return _build_response(tokens, eos_reached, finish_reason)
 
     # Speculative decoding path
     if config.use_speculative:
@@ -554,108 +712,117 @@ def generate_dict(
             speculative_generate_step = None
         if speculative_generate_step is None:
             # Fallback to normal path if not available
-            pass
+            speculative_fallback_reason = "speculative_generate_step_unavailable"
         else:
             # Load draft model if provided via config
             draft_model = None
+            draft_tokenizer = None
             if config.draft_model_id:
                 try:
                     # Use auto_load to support HF repo ids with on-demand conversion
                     from ..loader import auto_load  # type: ignore
 
-                    draft_model, _tk, _local = auto_load(config.draft_model_id)
+                    draft_model, draft_tokenizer, _local = auto_load(config.draft_model_id)
                 except Exception:
                     draft_model = None
+                    draft_tokenizer = None
+                    speculative_fallback_reason = "speculative_draft_model_load_failed"
+            else:
+                speculative_fallback_reason = "speculative_draft_model_missing"
             if draft_model is None:
                 # If no draft model, fallback to normal path
-                pass
+                if speculative_fallback_reason is None:
+                    speculative_fallback_reason = "speculative_draft_model_unavailable"
             else:
-                # Build sampler on normalized logprobs
-                sampler = make_sampler(
-                    temperature=config.temperature,
-                    top_p=config.top_p,
-                    top_k=config.top_k,
-                    min_p=config.min_p,
-                    min_tokens_to_keep=config.min_tokens_to_keep,
-                    typical_p=config.typical_p,
-                    epsilon_cutoff=config.epsilon_cutoff,
+                prompt_hint = prompt if isinstance(prompt, str) else None
+                tokenizer_ok, reason = _check_speculative_tokenizer_compatibility(
+                    tokenizer,
+                    draft_tokenizer,
+                    prompt_hint=prompt_hint,
                 )
-                tokens = list(prompt_ids)
-                n_generated = 0
-                eos_reached = False
-                finish_reason = None
-                # no prompt_cache rotation in this path beyond default
-                gen = speculative_generate_step(
-                    as_mx_array(tokens, dtype=mx.int32),
-                    model,
-                    draft_model,
-                    **filter_kwargs_for_callable(
-                        speculative_generate_step,
-                        {
-                            "num_draft_tokens": config.num_draft_tokens,
-                            "max_tokens": config.max_tokens,
-                            "sampler": sampler,
-                            "logits_processors": processors,
-                            "prompt_cache": None,
-                        },
-                    ),
-                )
-                for y, logprobs, _from_draft in gen:
-                    try:
-                        t = int(y.item())
-                    except Exception:
-                        t = int(y)
-                    tokens.append(t)
-                    n_generated += 1
-                    # EOS checks
-                    if config.forced_eos_token_id is not None and t == config.forced_eos_token_id:
-                        eos_reached = True
-                        finish_reason = "eos"
-                        break
-                    if eos_ids and t in eos_ids:
-                        eos_reached = True
-                        finish_reason = "eos"
-                        break
-                    # Token-level stop sequences
-                    if stop_token_seqs:
-                        hit = False
-                        for seq in stop_token_seqs:
-                            n = len(seq)
-                            if n > 0 and len(tokens) >= n and tokens[-n:] == seq:
-                                tokens = tokens[:-n]
-                                eos_reached = True
-                                finish_reason = "stop_sequence"
-                                hit = True
-                                break
-                        if hit:
+                if not tokenizer_ok:
+                    speculative_fallback_reason = reason or "speculative_draft_tokenizer_incompatible"
+                else:
+                    # Build sampler on normalized logprobs
+                    sampler = make_sampler(
+                        temperature=config.temperature,
+                        top_p=config.top_p,
+                        top_k=config.top_k,
+                        min_p=config.min_p,
+                        min_tokens_to_keep=config.min_tokens_to_keep,
+                        typical_p=config.typical_p,
+                        epsilon_cutoff=config.epsilon_cutoff,
+                    )
+                    tokens = list(prompt_ids)
+                    n_generated = 0
+                    eos_reached = False
+                    finish_reason = None
+                    speculative_raw_stop_state = _make_incremental_raw_stop_state(raw_stops, enabled=True)
+                    # no prompt_cache rotation in this path beyond default
+                    gen = speculative_generate_step(
+                        as_mx_array(tokens, dtype=mx.int32),
+                        model,
+                        draft_model,
+                        **filter_kwargs_for_callable(
+                            speculative_generate_step,
+                            {
+                                "num_draft_tokens": config.num_draft_tokens,
+                                "max_tokens": config.max_tokens,
+                                "sampler": sampler,
+                                "logits_processors": processors,
+                                "prompt_cache": None,
+                            },
+                        ),
+                    )
+                    for y, logprobs, _from_draft in gen:
+                        try:
+                            t = int(y.item())
+                        except Exception:
+                            t = int(y)
+                        tokens.append(t)
+                        n_generated += 1
+                        # EOS checks
+                        if config.forced_eos_token_id is not None and t == config.forced_eos_token_id:
+                            eos_reached = True
+                            finish_reason = "eos"
                             break
-                    # String fallback stops on generated suffix
-                    if raw_stops:
-                        gen_tokens = tokens[len(prompt_ids):]
-                        if gen_tokens:
-                            decoded_gen = tk.decode(gen_tokens)
-                            for s in raw_stops:
-                                if s and s in decoded_gen:
-                                    idx = decoded_gen.find(s)
-                                    text_trimmed = decoded_gen[:idx]
-                                    trimmed_gen_ids = tk.encode(text_trimmed, add_special_tokens=False)
-                                    tokens = tokens[: len(prompt_ids)] + trimmed_gen_ids
+                        if eos_ids and t in eos_ids:
+                            eos_reached = True
+                            finish_reason = "eos"
+                            break
+                        # Token-level stop sequences
+                        if stop_token_seqs:
+                            hit = False
+                            for seq in stop_token_seqs:
+                                n = len(seq)
+                                if n > 0 and len(tokens) >= n and tokens[-n:] == seq:
+                                    tokens = tokens[:-n]
                                     eos_reached = True
                                     finish_reason = "stop_sequence"
+                                    hit = True
                                     break
-                            if eos_reached:
+                            if hit:
                                 break
-                if finish_reason is None and n_generated >= config.max_tokens:
-                    finish_reason = "length"
-                text_out = tk.decode(tokens)
-                return {
-                    "text": text_out,
-                    "tokens": tokens,
-                    "eos_reached": eos_reached,
-                    "finish_reason": finish_reason,
-                    "stream_tokens_emitted": stream_observer.emitted if stream_observer else 0,
-                    "stream_invalid_path": bool(stream_observer and stream_observer.invalid_triggered),
-                }
+                        # String fallback stops on generated suffix
+                        if raw_stops:
+                            if speculative_raw_stop_state is not None:
+                                tokens, hit = _match_raw_stops_incremental(
+                                    tk,
+                                    tokens,
+                                    prompt_len,
+                                    raw_stops,
+                                    speculative_raw_stop_state,
+                                    t,
+                                )
+                            else:
+                                tokens, hit = _match_raw_stops_full_decode(tk, tokens, prompt_len, raw_stops)
+                            if hit:
+                                eos_reached = True
+                                finish_reason = "stop_sequence"
+                                break
+                    if finish_reason is None and n_generated >= config.max_tokens:
+                        finish_reason = "length"
+                    return _build_response(tokens, eos_reached, finish_reason)
 
     # generation loop
     while n_generated < config.max_tokens:
@@ -725,38 +892,27 @@ def generate_dict(
                 break
         # String-level fallback stop sequences
         if raw_stops:
-            # Only consider generated segment for stop matching
-            gen_tokens = tokens[len(prompt_ids):]
-            hit = False
-            if gen_tokens:
-                decoded_gen = tk.decode(gen_tokens)
-                for s in raw_stops:
-                    if s and s in decoded_gen:
-                        idx = decoded_gen.find(s)
-                        text_trimmed = decoded_gen[:idx]
-                        # Re-tokenize trimmed generated text
-                        trimmed_gen_ids = make_tokenizer_bridge(tokenizer).encode(text_trimmed, add_special_tokens=False)
-                        tokens = tokens[: len(prompt_ids)] + trimmed_gen_ids
-                        eos_reached = True
-                        finish_reason = "stop_sequence"
-                        hit = True
-                        break
-                if hit:
-                    break
+            if main_raw_stop_state is not None:
+                tokens, hit = _match_raw_stops_incremental(
+                    tk,
+                    tokens,
+                    prompt_len,
+                    raw_stops,
+                    main_raw_stop_state,
+                    t,
+                )
+            else:
+                tokens, hit = _match_raw_stops_full_decode(tk, tokens, prompt_len, raw_stops)
+            if hit:
+                eos_reached = True
+                finish_reason = "stop_sequence"
+                break
 
     if not finish_reason and n_generated >= config.max_tokens:
         finish_reason = "length"
     if invalid_stop and finish_reason is None:
         finish_reason = "invalid_path"
-    text_out = tk.decode(tokens)
-    return {
-        "text": text_out,
-        "tokens": tokens,
-        "eos_reached": eos_reached,
-        "finish_reason": finish_reason,
-        "stream_tokens_emitted": stream_observer.emitted if stream_observer else 0,
-        "stream_invalid_path": bool(stream_observer and stream_observer.invalid_triggered),
-    }
+    return _build_response(tokens, eos_reached, finish_reason)
 
 
 def _apply_forced_token_mask(logits, forced_token_id: Optional[int]):
@@ -788,10 +944,13 @@ def _beam_search_generate(setup: GenerationSetup) -> Dict[str, Any]:
     num_beams = int(config.num_beams)
     max_new = int(config.max_tokens)
     length_penalty = float(config.length_penalty or 0.0)
-    # beams: list of (tokens, score, finished)
-    beams: List[Tuple[List[int], float, bool]] = [(list(prompt_ids), 0.0, False)]
+    # beams: list of (tokens, score, finished, cache, primed)
+    # `primed` means cache already includes the full `tokens` prefix and
+    # subsequent steps can consume only the most recent token.
+    beams: List[Tuple[List[int], float, bool, Any, bool]] = [(list(prompt_ids), 0.0, False, None, False)]
     finished: List[Tuple[List[int], float]] = []
     n_generated = 0
+    use_cached_steps = True
 
     # Optional residual injection for beam path
     beam_injector = (
@@ -802,24 +961,58 @@ def _beam_search_generate(setup: GenerationSetup) -> Dict[str, Any]:
 
     while n_generated < max_new:
         # Prepare alive beams
-        alive = [(t, s) for (t, s, f) in beams if not f]
+        alive = [(t, s, c, p) for (t, s, f, c, p) in beams if not f]
         if not alive:
             break
-        seqs = [t for (t, s) in alive]
-        # Compute logits for each alive beam as a batch
-        if beam_injector and residual_hooks:
+
+        # Per-beam eval state: (tokens, score, cache_for_step, primed, logits)
+        eval_state: List[Tuple[List[int], float, Any, bool, Any]] = []
+        if use_cached_steps:
             try:
-                # Patch for current step using batch and seq len
-                beam_injector.patch(residual_hooks, n_generated, batch=len(seqs), seq_len=len(seqs[0]), model=model)
+                for tokens, score, beam_cache, primed in alive:
+                    if primed and tokens:
+                        step_input = as_mx_array([tokens[-1]], dtype=mx.int32)[None]
+                        step_cache = beam_cache
+                    else:
+                        step_input = as_mx_array(tokens, dtype=mx.int32)[None]
+                        step_cache = None
+                    if beam_injector and residual_hooks:
+                        try:
+                            beam_injector.patch(
+                                residual_hooks,
+                                n_generated,
+                                batch=1,
+                                seq_len=step_input.shape[1],
+                                model=model,
+                            )
+                            logits, next_cache = _step_logits(model, components, step_input, cache=step_cache)
+                        finally:
+                            beam_injector.restore()
+                    else:
+                        logits, next_cache = _step_logits(model, components, step_input, cache=step_cache)
+                    eval_state.append((tokens, score, next_cache, True, logits))
+            except Exception:
+                # Defensive fallback for models without usable cache semantics.
+                use_cached_steps = False
+                eval_state = []
+
+        if not eval_state:
+            seqs = [t for (t, _s, _c, _p) in alive]
+            # Fallback batch path (full-sequence logits each step).
+            if beam_injector and residual_hooks:
+                try:
+                    beam_injector.patch(residual_hooks, n_generated, batch=len(seqs), seq_len=len(seqs[0]), model=model)
+                    logits_batch = _batched_last_logits(model, components, seqs)
+                finally:
+                    beam_injector.restore()
+            else:
                 logits_batch = _batched_last_logits(model, components, seqs)
-            finally:
-                beam_injector.restore()
-        else:
-            logits_batch = _batched_last_logits(model, components, seqs)
+            for i, (tokens, score, _beam_cache, _primed) in enumerate(alive):
+                eval_state.append((tokens, score, None, False, logits_batch[i : i + 1, :]))
+
         # For each beam, apply processors and constraints
         candidates: List[Tuple[float, int, int]] = []  # (new_score, beam_index, token)
-        for i, (tokens, score) in enumerate(alive):
-            logits = logits_batch[i : i + 1, :]
+        for i, (tokens, score, next_cache, next_primed, logits) in enumerate(eval_state):
             for proc in processors:
                 logits = proc(tokens, logits)
             # Forced tokens
@@ -844,11 +1037,11 @@ def _beam_search_generate(setup: GenerationSetup) -> Dict[str, Any]:
 
         # Select overall top beams
         candidates.sort(key=lambda x: x[0], reverse=True)
-        new_beams: List[Tuple[List[int], float, bool]] = []
+        new_beams: List[Tuple[List[int], float, bool, Any, bool]] = []
         for new_score, i_beam, tok in candidates:
             if len(new_beams) >= num_beams:
                 break
-            base_tokens, base_score = alive[i_beam]
+            base_tokens, _base_score, base_cache, base_primed, _base_logits = eval_state[i_beam]
             new_tokens = base_tokens + [tok]
             # Finish checks: eos ids or stop sequences
             is_finish = False
@@ -876,18 +1069,26 @@ def _beam_search_generate(setup: GenerationSetup) -> Dict[str, Any]:
                             trimmed_tokens = new_tokens[: len(prompt_ids)] + trimmed_ids
                             is_finish = True
                             break
-            new_beams.append((trimmed_tokens if is_finish else new_tokens, new_score, is_finish))
+            new_beams.append(
+                (
+                    trimmed_tokens if is_finish else new_tokens,
+                    new_score,
+                    is_finish,
+                    base_cache,
+                    base_primed,
+                )
+            )
 
         beams = new_beams
         # Move finished beams out, keep up to num_beams alive
-        alive_next: List[Tuple[List[int], float, bool]] = []
-        for t, s, f in beams:
+        alive_next: List[Tuple[List[int], float, bool, Any, bool]] = []
+        for t, s, f, c, p in beams:
             if f:
                 length = max(1, len(t) - len(prompt_ids))
                 norm = (length ** (length_penalty)) if length_penalty != 0.0 else 1.0
                 finished.append((t, s / norm))
             else:
-                alive_next.append((t, s, f))
+                alive_next.append((t, s, f, c, p))
         # Keep best alive beams
         alive_next.sort(key=lambda x: x[1], reverse=True)
         beams = alive_next[: num_beams]
@@ -899,7 +1100,7 @@ def _beam_search_generate(setup: GenerationSetup) -> Dict[str, Any]:
 
     # If no finished, take best alive
     if not finished:
-        finished = [(t, s) for (t, s, f) in beams]
+        finished = [(t, s) for (t, s, _f, _c, _p) in beams]
         # Normalize scores
         finished = [
             (t, (s / (max(1, len(t) - len(prompt_ids)) ** length_penalty)) if length_penalty != 0.0 else s)
@@ -907,7 +1108,7 @@ def _beam_search_generate(setup: GenerationSetup) -> Dict[str, Any]:
         ]
     finished.sort(key=lambda x: x[1], reverse=True)
     best_tokens = finished[0][0]
-    text_out = tk.decode(best_tokens)
+    text_out = _decode_generated_suffix(tk, best_tokens, len(prompt_ids))
     if best_tokens and eos_ids and (best_tokens[-1] in eos_ids):
         finish_reason = "eos"
     elif n_generated >= max_new:
@@ -955,6 +1156,8 @@ class MlxGenerateBackend:
             meta.setdefault("stream_tokens_emitted", raw["stream_tokens_emitted"])
         if raw.get("stream_invalid_path"):
             meta.setdefault("stream_invalid_path", True)
+        if raw.get("speculative_fallback_reason"):
+            meta.setdefault("speculative_fallback_reason", raw["speculative_fallback_reason"])
         return GenerateResult(
             text=raw.get("text", ""),
             tokens=raw.get("tokens"),

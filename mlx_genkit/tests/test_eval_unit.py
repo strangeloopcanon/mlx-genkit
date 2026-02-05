@@ -4,6 +4,7 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from mlx_genkit.eval import EvalSuite
@@ -69,6 +70,51 @@ class EvalSuiteTests(unittest.TestCase):
             self.assertEqual(summary["passed"], 1)
         finally:
             os.unlink(suite_path)
+
+    def test_eval_suite_resolves_relative_paths_from_suite_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            suite_dir = Path(tmpdir)
+            fixtures = suite_dir / "fixtures"
+            fixtures.mkdir(parents=True, exist_ok=True)
+
+            grammar_text = 'root ::= "ok"'
+            (fixtures / "case.gbnf").write_text(grammar_text, encoding="utf-8")
+            (fixtures / "checks.json").write_text(
+                json.dumps(
+                    [
+                        {
+                            "type": "must_contain",
+                            "field": "foo",
+                            "substrings": ["bar"],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            suite_payload = {
+                "name": "relative_paths_suite",
+                "model": "stub/model",
+                "semantic_checks": "fixtures/checks.json",
+                "cases": [
+                    {
+                        "name": "relative_case",
+                        "prompt": "Return JSON",
+                        "grammar_gbnf": "fixtures/case.gbnf",
+                    }
+                ],
+            }
+            suite_path = suite_dir / "suite.json"
+            suite_path.write_text(json.dumps(suite_payload), encoding="utf-8")
+
+            suite = EvalSuite(str(suite_path))
+
+            self.assertEqual(suite.cases[0].grammar.kind, "gbnf")
+            self.assertEqual(suite.cases[0].grammar.payload, grammar_text)
+            self.assertIsNotNone(suite.cases[0].semantic_checks)
+            self.assertEqual(len(suite.cases[0].semantic_checks), 1)
+            check = suite.cases[0].semantic_checks[0]
+            self.assertEqual(getattr(check, "name", None), "must_contain")
 
 
 if __name__ == "__main__":  # pragma: no cover

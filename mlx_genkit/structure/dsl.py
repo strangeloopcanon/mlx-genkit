@@ -12,7 +12,15 @@ from ..config import GenerationConfig
 def _strip_fences(text: str) -> str:
     text = text.strip()
     if text.startswith("```") and text.endswith("```"):
-        return text.strip("`")
+        inner = text[3:-3]
+        if inner.startswith("\n"):
+            inner = inner[1:]
+        first_newline = inner.find("\n")
+        if first_newline != -1:
+            maybe_lang = inner[:first_newline].strip()
+            if maybe_lang and all(ch.isalnum() or ch in "._+-" for ch in maybe_lang):
+                inner = inner[first_newline + 1 :]
+        return inner.strip()
     return text
 
 

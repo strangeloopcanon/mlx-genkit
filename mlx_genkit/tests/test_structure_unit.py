@@ -10,6 +10,7 @@ from mlx_genkit.structure.batch import generate_many
 from mlx_genkit.structure.result import GenerateResult
 from mlx_genkit.structure.grammar import Grammar
 from mlx_genkit.structure.stream import StreamCallbacks, build_stream_observer
+from mlx_genkit.structure.dsl import _strip_fences
 
 
 class _StubBackend:
@@ -35,6 +36,14 @@ class StructureTests(unittest.TestCase):
             result = generate(None, None, "hi", cfg)
         self.assertIsInstance(result, GenerateResult)
         self.assertEqual(result["text"], "ok")
+
+    def test_strip_fences_removes_outer_markers_only(self):
+        text = "```json\n{\n  \"a\": 1\n}\n```"
+        self.assertEqual(_strip_fences(text), '{\n  "a": 1\n}')
+
+    def test_strip_fences_preserves_inner_backticks(self):
+        text = "```text\n`value`\n```"
+        self.assertEqual(_strip_fences(text), "`value`")
 
     def test_structured_generation_with_retry(self):
         backend = _StubBackend(["not json", json.dumps({"a": 1})])
@@ -135,6 +144,102 @@ class StructureTests(unittest.TestCase):
         self.assertFalse(result.schema_ok)
         self.assertIsNone(result.json)
         self.assertTrue(any(v.get("type") == "parse_error" for v in result.violations))
+
+    def test_strict_json_auto_trim_does_not_extract_inline_snippet(self):
+        text = 'Here you go: {"a": 1}'
+        backend = _StubBackend([text])
+        engine = StructuredGenerationEngine(
+            backend=backend,
+            prompt="respond",
+            config=GenerationConfig(),
+            hooks=None,
+            json_schema={"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            grammar=None,
+            validators=[lambda data: (isinstance(data.get("a"), int), None)],
+            semantic_checks=None,
+            adherence=JsonAdherence(retries=0, strict_only_json=True, auto_trim_fences=True),
+            on_parse_fail=None,
+            on_semantic_fail=None,
+            log_writer=None,
+        )
+        result = engine.run()
+        self.assertFalse(result.schema_ok)
+        self.assertIsNone(result.json)
+        self.assertTrue(any(v.get("type") == "parse_error" for v in result.violations))
+
+    def test_multiple_validators_all_must_pass_and_collect_errors(self):
+        backend = _StubBackend([json.dumps({"a": 1})])
+        engine = StructuredGenerationEngine(
+            backend=backend,
+            prompt="respond",
+            config=GenerationConfig(),
+            hooks=None,
+            json_schema={"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            grammar=None,
+            validators=[
+                lambda data: (data.get("a") == 1, None),
+                lambda _data: (False, ["missing required field: b"]),
+                lambda _data: (False, "custom validation failed"),
+            ],
+            semantic_checks=None,
+            adherence=JsonAdherence(retries=0, strict_only_json=True),
+            on_parse_fail=None,
+            on_semantic_fail=None,
+            log_writer=None,
+        )
+        result = engine.run()
+        self.assertFalse(result.schema_ok)
+        self.assertIsNotNone(result.violations)
+        schema_violations = [v for v in result.violations if v.get("type") == "schema_validation"]
+        self.assertEqual(len(schema_violations), 1)
+        errors = schema_violations[0]["errors"]
+        self.assertIn("missing required field: b", errors)
+        self.assertIn("custom validation failed", errors)
+
+    def test_callable_validator_string_return_is_failure(self):
+        backend = _StubBackend([json.dumps({"a": 1})])
+        engine = StructuredGenerationEngine(
+            backend=backend,
+            prompt="respond",
+            config=GenerationConfig(),
+            hooks=None,
+            json_schema={"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            grammar=None,
+            validators=[lambda _data: "string-returned-error"],
+            semantic_checks=None,
+            adherence=JsonAdherence(retries=0, strict_only_json=True),
+            on_parse_fail=None,
+            on_semantic_fail=None,
+            log_writer=None,
+        )
+        result = engine.run()
+        self.assertFalse(result.schema_ok)
+        schema_violations = [v for v in result.violations if v.get("type") == "schema_validation"]
+        self.assertEqual(len(schema_violations), 1)
+        self.assertIn("string-returned-error", schema_violations[0]["errors"])
+
+    def test_callable_validator_iterable_return_is_failure(self):
+        backend = _StubBackend([json.dumps({"a": 1})])
+        engine = StructuredGenerationEngine(
+            backend=backend,
+            prompt="respond",
+            config=GenerationConfig(),
+            hooks=None,
+            json_schema={"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]},
+            grammar=None,
+            validators=[lambda _data: ["first-error", "second-error"]],
+            semantic_checks=None,
+            adherence=JsonAdherence(retries=0, strict_only_json=True),
+            on_parse_fail=None,
+            on_semantic_fail=None,
+            log_writer=None,
+        )
+        result = engine.run()
+        self.assertFalse(result.schema_ok)
+        schema_violations = [v for v in result.violations if v.get("type") == "schema_validation"]
+        self.assertEqual(len(schema_violations), 1)
+        self.assertIn("first-error", schema_violations[0]["errors"])
+        self.assertIn("second-error", schema_violations[0]["errors"])
 
     def test_json_schema_grammar_reports_not_supported(self):
         backend = _StubBackend([json.dumps({"a": 1})])

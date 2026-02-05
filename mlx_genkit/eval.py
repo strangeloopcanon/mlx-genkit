@@ -20,13 +20,20 @@ from .structure.semantic import build_semantic_checks
 from .structure.validators import ValidatorLike
 
 
-def _load_suite(path: str) -> Dict[str, Any]:
-    content = Path(path).expanduser().read_text(encoding="utf-8")
+def _resolve_path(path: str, *, base_dir: Optional[Path] = None) -> Path:
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute() and base_dir is not None:
+        resolved = base_dir / resolved
+    return resolved.resolve()
+
+
+def _load_suite(path: str, *, require_object: bool = True) -> Any:
+    content = _resolve_path(path).read_text(encoding="utf-8")
     if yaml is not None:
         data = yaml.safe_load(content)
     else:
         data = json.loads(content)
-    if not isinstance(data, dict):
+    if require_object and not isinstance(data, dict):
         raise ValueError("Suite file must decode to an object")
     return data
 
@@ -70,14 +77,16 @@ class EvalOutcome:
 
 class EvalSuite:
     def __init__(self, suite_path: str) -> None:
-        self.raw = _load_suite(suite_path)
+        self.suite_path = _resolve_path(suite_path)
+        self.suite_dir = self.suite_path.parent
+        self.raw = _load_suite(str(self.suite_path), require_object=True)
         self.model_id = self.raw.get("model")
         if not self.model_id:
             raise ValueError("Suite must specify a 'model'")
         base_cfg = self.raw.get("config", {})
         self.base_config = GenerationConfig(**base_cfg)
         self.cases = self._build_cases(self.raw.get("cases") or self.raw.get("items") or [])
-        self.name = self.raw.get("name") or Path(suite_path).stem
+        self.name = self.raw.get("name") or self.suite_path.stem
 
     def _build_cases(self, items: Sequence[Dict[str, Any]]) -> List[EvalCase]:
         cases: List[EvalCase] = []
@@ -95,7 +104,8 @@ class EvalSuite:
             json_schema = item.get("json_schema")
             grammar = None
             if item.get("grammar_gbnf"):
-                grammar_text = Path(item["grammar_gbnf"]).expanduser().read_text(encoding="utf-8")
+                grammar_path = _resolve_path(item["grammar_gbnf"], base_dir=self.suite_dir)
+                grammar_text = grammar_path.read_text(encoding="utf-8")
                 grammar = Grammar.gbnf(grammar_text)
             elif json_schema is not None:
                 grammar = Grammar.json_schema(json_schema)
@@ -110,7 +120,7 @@ class EvalSuite:
             semantic_checks = None
             checks_def = item.get("semantic_checks") or self.raw.get("semantic_checks")
             if checks_def:
-                spec_list = _load_semantic_defs(checks_def)
+                spec_list = _load_semantic_defs(checks_def, base_dir=self.suite_dir)
                 if spec_list:
                     semantic_checks = build_semantic_checks(spec_list)
             config_overrides = item.get("config") or {}
@@ -185,11 +195,11 @@ class EvalSuite:
                 for o in outcomes
             ],
         }
-def _load_semantic_defs(defs: Any) -> Optional[List[Dict[str, Any]]]:
+def _load_semantic_defs(defs: Any, *, base_dir: Optional[Path] = None) -> Optional[List[Dict[str, Any]]]:
     if defs is None:
         return None
     if isinstance(defs, str):
-        data = _load_suite(defs)
+        data = _load_suite(str(_resolve_path(defs, base_dir=base_dir)), require_object=False)
         if isinstance(data, dict):
             defs = data.get("checks") or data.get("semantic_checks")
         else:

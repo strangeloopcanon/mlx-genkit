@@ -27,6 +27,37 @@ def _parse_int_list(s: str) -> List[int]:
     return [int(x) for x in s.split(",") if x.strip()]
 
 
+def _parse_optional_int_list(value: Optional[str], *, flag_name: str) -> Optional[List[int]]:
+    if value is None:
+        return None
+    try:
+        parsed = _parse_int_list(value)
+    except ValueError as exc:
+        raise SystemExit(f"{flag_name} must be a comma-separated list of integers") from exc
+    return parsed or None
+
+
+def _resolve_safe_cache_subpath(cache_dir: str, model_id_or_path: str) -> tuple[str, str]:
+    model_input = (model_id_or_path or "").strip()
+    if not model_input:
+        raise SystemExit("Model id/path cannot be empty")
+
+    local_name = _sanitize_repo_id(model_input)
+    if not local_name or local_name in {".", ".."} or not any(ch.isalnum() for ch in local_name):
+        raise SystemExit(f"Model id/path '{model_id_or_path}' cannot be converted to a safe cache directory")
+
+    cache_root = Path(cache_dir).expanduser().resolve()
+    cache_root.mkdir(parents=True, exist_ok=True)
+    local_path = (cache_root / local_name).resolve()
+    if local_path == cache_root:
+        raise SystemExit("Refusing to operate on cache root")
+    try:
+        local_path.relative_to(cache_root)
+    except ValueError as exc:  # pragma: no cover - defensive guard
+        raise SystemExit("Refusing to operate outside cache directory") from exc
+    return model_input, str(local_path)
+
+
 def _looks_like_chat_model(model_id_or_path: str) -> bool:
     """Heuristic to decide if a model is a chat/instruct variant.
 
@@ -306,6 +337,11 @@ def generate_cmd():
     if args.force_words:
         phrases = [p for p in args.force_words.split(",") if p.strip()]
         force_words_ids = [tokenizer.encode(p, add_special_tokens=False) for p in phrases]
+    suppress_tokens = _parse_optional_int_list(args.suppress_tokens, flag_name="--suppress-tokens")
+    begin_suppress_tokens = _parse_optional_int_list(
+        args.begin_suppress_tokens,
+        flag_name="--begin-suppress-tokens",
+    )
 
     # Merge legacy --stop and alias --stop-strings
     stop_sequences = None
@@ -354,6 +390,8 @@ def generate_cmd():
         assume_user_chat=args.assume_user_chat,
         stop_strings=stop_sequences,
         force_words_ids=force_words_ids,
+        suppress_tokens=suppress_tokens,
+        begin_suppress_tokens=begin_suppress_tokens,
         use_speculative=args.speculative,
         draft_model_id=args.draft_model,
         backend=args.backend,
@@ -442,19 +480,19 @@ def download_cmd():
     args = ap.parse_args()
 
     cache_dir = args.cache_dir or os.path.join(os.getcwd(), "mlx_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    local_name = _sanitize_repo_id(args.model)
-    local_path = os.path.join(cache_dir, local_name)
+    model_input, local_path = _resolve_safe_cache_subpath(cache_dir, args.model)
 
     if args.force and os.path.exists(local_path):
         import shutil
 
+        if os.path.islink(local_path) or not os.path.isdir(local_path):
+            raise SystemExit(f"Refusing to delete non-directory cache path: {local_path}")
         shutil.rmtree(local_path)
 
     # Convert without loading into memory
     _m, _t, out_path = auto_load(
-        args.model,
-        cache_dir=cache_dir,
+        model_input,
+        cache_dir=str(Path(cache_dir).expanduser().resolve()),
         quantize=args.quantize,
         trust_remote_code=args.trust_remote_code,
         load_model=False,

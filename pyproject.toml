@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -9,13 +9,14 @@ description = "MLX generation parity utils with HF/Torch-compatible sampling, pr
 authors = [{name = "Your Team"}]
 readme = "README.md"
 requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 dependencies = [
   "mlx>=0.17.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
   "mlx-lm>=0.17.0; platform_system == 'Darwin' and platform_machine == 'arm64'",
   "transformers>=4.40.0; python_version >= '3.9'",
 ]
 classifiers = [
-  "License :: OSI Approved :: Apache Software License",
   "Programming Language :: Python :: 3",
 ]
 
@@ -33,11 +34,10 @@ data = [
 ]
 
 [tool.setuptools]
-packages = ["mlx_genkit"]
-license-files = []
+include-package-data = true
 
-[tool.setuptools.package-data]
-mlx_genkit = ["**/*.py"]
+[tool.setuptools.packages.find]
+include = ["mlx_genkit*"]
 
 [project.scripts]
 mlxgk-generate = "mlx_genkit.cli:generate_cmd"

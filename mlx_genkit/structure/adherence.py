@@ -331,6 +331,9 @@ class StructuredGenerationEngine:
             body = match.group("body")
             add_candidate(body)
 
+        if self.adherence.strict_only_json:
+            return variants
+
         for idx, ch in enumerate(text):
             if ch not in "{[":
                 continue
@@ -366,16 +369,25 @@ class StructuredGenerationEngine:
     def _run_validators(self, obj: Any) -> Tuple[bool, Optional[str], List[str]]:
         if not self.validator_fns:
             return True, None, []
-        errors = []
-        last_name: Optional[str] = None
+        errors: List[str] = []
+        passed_names: List[str] = []
+        failed_names: List[str] = []
         for validator in self.validator_fns:
             name = getattr(validator, "__validator_name__", getattr(validator, "__name__", "validator"))
             outcome: ValidatorResult = validator(obj)
+            resolved_name = outcome.validator_name or name
             if outcome.ok:
-                return True, outcome.validator_name or name, []
-            last_name = outcome.validator_name or name
-            errors.extend(outcome.errors)
-        return False, last_name, errors
+                passed_names.append(resolved_name)
+                continue
+            failed_names.append(resolved_name)
+            if outcome.errors:
+                errors.extend(outcome.errors)
+            else:
+                errors.append(f"{resolved_name} failed validation")
+        if failed_names:
+            return False, ", ".join(failed_names), errors
+        combined_name = ", ".join(passed_names) if passed_names else None
+        return True, combined_name, []
 
     def _parse_json(self, text: str) -> Tuple[bool, Optional[Any], Optional[Exception], bool]:
         stripped = text.strip()

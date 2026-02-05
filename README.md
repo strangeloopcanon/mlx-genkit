@@ -13,6 +13,7 @@ Features
 - Batch helpers, JSONL adherence logging, and an eval harness for prompt suites.
 - Training (MLX): `loss_forward`, `xent_loss` (label smoothing), mixed-precision compute (bf16) with fp32 master weights.
 - Training utilities: `sequence_logprob`, `token_kl` for scoring and policy KL.
+- RL objectives: `ppo_loss`, `grpo_advantages`/`grpo_loss`, and `gspo_loss` for reward-driven policy optimization.
 - Model helpers: `ema_update`, `build_action_mask`, `stable_softmax`; best-effort `clone_reference`.
 
 Install
@@ -197,6 +198,34 @@ cfg = TrainingConfig(dtype='bf16', loss_scale=1024.0)
 loss = train_step(model, batch, opt, cfg, hooks=[SoftPromptHook(n_virtual=10, param_key='_soft_prompt')], pad_id=pad_id)
 ```
 
+RL objectives (PPO / GRPO / GSPO)
+```
+from mlx_genkit import (
+    PPOConfig, ppo_loss,
+    GRPOConfig, grpo_advantages, grpo_loss,
+    GSPOConfig, gspo_loss,
+)
+
+# PPO (sampled action log-probs)
+total, stats = ppo_loss(
+    logp_new=logp_new, logp_old=logp_old, advantage=adv,
+    value_pred=v_pred, value_target=v_tgt, cfg=PPOConfig()
+)
+
+# GRPO (grouped completions: rewards shape [num_prompts, samples_per_prompt])
+adv_group = grpo_advantages(group_rewards)
+total, stats = grpo_loss(
+    logp_new=seq_logp_new, logp_old=seq_logp_old, advantages=adv_group, cfg=GRPOConfig(kl_coef=0.02),
+    logp_ref=seq_logp_ref,
+)
+
+# GSPO (token-level objective with mask over valid generated tokens)
+total, stats = gspo_loss(
+    logp_new=tok_logp_new, logp_old=tok_logp_old, advantages=tok_adv,
+    mask=action_mask, cfg=GSPOConfig(kl_coef=0.02), logp_ref=tok_logp_ref,
+)
+```
+
 Utilities
 ```
 from mlx_genkit import sequence_logprob, token_kl, ema_update, build_action_mask
@@ -284,11 +313,13 @@ python -m mlx_genkit.tests.perf_bench --hf-model Qwen/Qwen3-0.6B --mlx-model ./m
 ```
 
 Releases
-- Bump version across files (defaults to patch):
-  - `make bump-version` (use `PART=minor` or `PART=major` to override)
-- Create and push a git tag (vX.Y.Z):
-  - `make git-release`
-  - This tags and pushes the repo; PyPI packaging can be added later.
+- End-to-end release (recommended):
+  - `make publish`
+  - This flow bumps patch version, commits the bump, runs unit tests, builds artifacts, runs `twine check`, uploads to PyPI, tags/pushes `vX.Y.Z`, and creates a GitHub release.
+  - To bump a different part first: `make bump-version PART=minor` (or `PART=major`) before `make publish`.
+- Manual package upload:
+  - `make build-check` to produce `dist/*` and validate metadata.
+  - `make pypi` to upload to PyPI (or `make test-pypi` for TestPyPI).
 
 Notes
 - Parity targets control‑surface equivalence: constraints, stops, finish reasons, determinism; token streams may differ across frameworks/devices.

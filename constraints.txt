@@ -1,0 +1,4 @@
+# Shared constraints for CI and release tooling.
+# Keep this minimal and pin only tools that affect packaging/release reproducibility.
+build==1.2.2.post1
+twine==6.1.0

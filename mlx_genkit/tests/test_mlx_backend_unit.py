@@ -129,7 +129,8 @@ class GenerationTextBehaviorTests(unittest.TestCase):
         with patch.object(mlx_backend, "try_import_mlx", return_value=(fake_mx, None)):
             with patch.object(mlx_backend, "as_mx_array", return_value=_FakeTokenBatch()):
                 with patch.object(mlx_backend, "_build_generation_setup", return_value=setup):
-                    out = mlx_backend.generate_dict(object(), tokenizer, "Hi", cfg)
+                    with patch.object(mlx_backend, "make_sampler", return_value=lambda _lp: None):
+                        out = mlx_backend.generate_dict(object(), tokenizer, "Hi", cfg)
         self.assertEqual(out["tokens"], prompt_ids)
         self.assertEqual(out["text"], "")
 
